@@ -17,6 +17,7 @@
 
 #include "command.h"
 #include "hash.h"
+#include "rwlock.h"
 
 long long current_timestamp(void);
 
@@ -26,10 +27,17 @@ void log_read_lock_released(FILE* logFile, int priority);
 void log_write_lock_acquired(FILE* logFile, int priority);
 void log_write_lock_released(FILE* logFile, int priority);
 
-typedef struct {
+typedef struct Scheduler {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int current_priority;
+} Scheduler;
+typedef struct ThreadData {
     Command cmd;
     hashRecord** head;
     FILE* logFile;
+    Scheduler* scheduler;
+    RWLock* dbLock;
 } ThreadData;
 
 long long current_timestamp() {
@@ -43,17 +51,34 @@ long long current_timestamp() {
 void* execute_command(void* arg) {
     ThreadData* data = (ThreadData*)arg;
 
+    Scheduler* scheduler = data->scheduler;
+
+    RWLock* dbLock = data->dbLock;
+
     Command cmd = data->cmd;
     hashRecord** head = data->head;
     FILE* logFile = data->logFile;
 
+    pthread_mutex_lock(&scheduler->mutex);
+
+    while (cmd.priority != scheduler->current_priority) {
+        fprintf(logFile, "%lld: THREAD %d WAITING FOR MY TURN\n",
+                current_timestamp(), cmd.priority);
+
+        pthread_cond_wait(&scheduler->cond, &scheduler->mutex);
+    }
+
+    fprintf(logFile, "%lld: THREAD %d AWAKENED FOR WORK\n", current_timestamp(),
+            cmd.priority);
+
+    pthread_mutex_unlock(&scheduler->mutex);
+
     if (cmd.type == CMD_INSERT) {
         log_command(logFile, cmd.priority, cmd.original_line);
+        rwlock_acquire_write(dbLock);
         log_write_lock_acquired(logFile, cmd.priority);
 
         int result = insert_record(head, cmd.name, cmd.salary);
-
-        log_write_lock_released(logFile, cmd.priority);
 
         if (result == 0) {
             hashRecord* record = search_record(*head, cmd.name);
@@ -63,15 +88,17 @@ void* execute_command(void* arg) {
             uint32_t hash = jenkins_hash(cmd.name);
             printf("Insert failed. Entry %u is a duplicate.\n", hash);
         }
+
+        log_write_lock_released(logFile, cmd.priority);
+        rwlock_release_write(dbLock);
     }
 
     else if (cmd.type == CMD_DELETE) {
         log_command(logFile, cmd.priority, cmd.original_line);
+        rwlock_acquire_write(dbLock);
         log_write_lock_acquired(logFile, cmd.priority);
 
         int result = delete_record(head, cmd.name);
-
-        log_write_lock_released(logFile, cmd.priority);
 
         if (result == 0) {
             printf("Deleted record for %s\n", cmd.name);
@@ -79,10 +106,15 @@ void* execute_command(void* arg) {
             uint32_t hash = jenkins_hash(cmd.name);
             printf("Delete failed. Entry %u not found.\n", hash);
         }
+
+        log_write_lock_released(logFile, cmd.priority);
+        rwlock_release_write(dbLock);
     }
 
     else if (cmd.type == CMD_UPDATE) {
         log_command(logFile, cmd.priority, cmd.original_line);
+
+        rwlock_acquire_write(dbLock);
         log_write_lock_acquired(logFile, cmd.priority);
 
         hashRecord* before = search_record(*head, cmd.name);
@@ -102,15 +134,15 @@ void* execute_command(void* arg) {
         }
 
         log_write_lock_released(logFile, cmd.priority);
+        rwlock_release_write(dbLock);
     }
 
     else if (cmd.type == CMD_SEARCH) {
         log_command(logFile, cmd.priority, cmd.original_line);
+        rwlock_acquire_read(dbLock);
         log_read_lock_acquired(logFile, cmd.priority);
 
         hashRecord* record = search_record(*head, cmd.name);
-
-        log_read_lock_released(logFile, cmd.priority);
 
         if (record != NULL) {
             printf("Found: %u,%s,%u\n", record->hash, record->name,
@@ -118,16 +150,26 @@ void* execute_command(void* arg) {
         } else {
             printf("Not Found: %s not found.\n", cmd.name);
         }
+
+        log_read_lock_released(logFile, cmd.priority);
+        rwlock_release_read(dbLock);
     }
 
     else if (cmd.type == CMD_PRINT) {
         log_command(logFile, cmd.priority, cmd.original_line);
+        rwlock_acquire_read(dbLock);
         log_read_lock_acquired(logFile, cmd.priority);
 
         print_records(*head);
 
         log_read_lock_released(logFile, cmd.priority);
+        rwlock_release_read(dbLock);
     }
+
+    pthread_mutex_lock(&scheduler->mutex);
+    scheduler->current_priority++;
+    pthread_cond_broadcast(&scheduler->cond);
+    pthread_mutex_unlock(&scheduler->mutex);
 
     return NULL;
 }
@@ -183,6 +225,14 @@ int main(void) {
         return 1;
     }
     char line[256];
+
+    Scheduler scheduler;
+    pthread_mutex_init(&scheduler.mutex, NULL);
+    pthread_cond_init(&scheduler.cond, NULL);
+    scheduler.current_priority = 1;
+
+    RWLock dbLock;
+    rwlock_init(&dbLock);
 
     while (fgets(line, sizeof(line), fp) != NULL) {
         line[strcspn(line, "\r\n")] = '\0';
@@ -263,17 +313,27 @@ int main(void) {
     qsort(commands, command_count, sizeof(Command),
           compare_commands_by_priority);
 
+    pthread_t threads[100];
+    ThreadData threadData[100];
+
     for (int i = 0; i < command_count; i++) {
-        pthread_t thread;
-        ThreadData data;
+        threadData[i].cmd = commands[i];
+        threadData[i].head = &head;
+        threadData[i].logFile = logFile;
+        threadData[i].scheduler = &scheduler;
+        threadData[i].dbLock = &dbLock;
 
-        data.cmd = commands[i];
-        data.head = &head;
-        data.logFile = logFile;
-
-        pthread_create(&thread, NULL, execute_command, &data);
-        pthread_join(thread, NULL);
+        pthread_create(&threads[i], NULL, execute_command, &threadData[i]);
     }
+
+    for (int i = 0; i < command_count; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    pthread_mutex_destroy(&scheduler.mutex);
+    pthread_cond_destroy(&scheduler.cond);
+
+    rwlock_destroy(&dbLock);
 
     fclose(fp);
     fclose(logFile);
