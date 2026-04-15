@@ -21,7 +21,10 @@ typedef struct {
     char name[50];
     uint32_t salary;
     int priority;
+    int order;
     char original_line[256];
 } Command;
+
+int parse_command_line(const char* line, Command* cmd, int order);
 
 #endif
