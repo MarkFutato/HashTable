@@ -1,0 +1,6 @@
+insert,Sid Meier,50000,1
+insert,Richard Garriot,40000,2
+delete,Richard Garriot,3
+search,Richard Garriot,4
+search,Sid Meier,5
+print,6
