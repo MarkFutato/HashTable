@@ -18,6 +18,7 @@
 #include "command.h"
 #include "hash.h"
 #include "rwlock.h"
+#include "scheduler.h"
 
 long long current_timestamp(void);
 
@@ -27,11 +28,6 @@ void log_read_lock_released(FILE* logFile, int priority);
 void log_write_lock_acquired(FILE* logFile, int priority);
 void log_write_lock_released(FILE* logFile, int priority);
 
-typedef struct Scheduler {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    int current_priority;
-} Scheduler;
 typedef struct ThreadData {
     Command cmd;
     hashRecord** head;
@@ -59,19 +55,7 @@ void* execute_command(void* arg) {
     hashRecord** head = data->head;
     FILE* logFile = data->logFile;
 
-    pthread_mutex_lock(&scheduler->mutex);
-
-    while (cmd.priority != scheduler->current_priority) {
-        fprintf(logFile, "%lld: THREAD %d WAITING FOR MY TURN\n",
-                current_timestamp(), cmd.priority);
-
-        pthread_cond_wait(&scheduler->cond, &scheduler->mutex);
-    }
-
-    fprintf(logFile, "%lld: THREAD %d AWAKENED FOR WORK\n", current_timestamp(),
-            cmd.priority);
-
-    pthread_mutex_unlock(&scheduler->mutex);
+    scheduler_wait_turn(scheduler, cmd.order, cmd.priority, logFile);
 
     if (cmd.type == CMD_INSERT) {
         log_command(logFile, cmd.priority, cmd.original_line);
@@ -166,10 +150,7 @@ void* execute_command(void* arg) {
         rwlock_release_read(dbLock);
     }
 
-    pthread_mutex_lock(&scheduler->mutex);
-    scheduler->current_priority++;
-    pthread_cond_broadcast(&scheduler->cond);
-    pthread_mutex_unlock(&scheduler->mutex);
+    scheduler_finish_turn(scheduler);
 
     return NULL;
 }
@@ -227,9 +208,7 @@ int main(void) {
     char line[256];
 
     Scheduler scheduler;
-    pthread_mutex_init(&scheduler.mutex, NULL);
-    pthread_cond_init(&scheduler.cond, NULL);
-    scheduler.current_priority = 1;
+    scheduler_init(&scheduler);
 
     RWLock dbLock;
     rwlock_init(&dbLock);
@@ -237,81 +216,19 @@ int main(void) {
     while (fgets(line, sizeof(line), fp) != NULL) {
         line[strcspn(line, "\r\n")] = '\0';
 
-        char originalLine[256];
-        strcpy(originalLine, line);
-
-        char* token = strtok(line, ",");
-
-        if (token == NULL) {
-            continue;
-        }
-
         Command cmd;
-        cmd.type = CMD_INVALID;
-        cmd.name[0] = '\0';
-        cmd.salary = 0;
-        cmd.priority = 0;
-        strcpy(cmd.original_line, originalLine);
 
-        if (strcmp(token, "insert") == 0) {
-            char* name = strtok(NULL, ",");
-            char* salary_str = strtok(NULL, ",");
-            char* priority_str = strtok(NULL, ",");
-
-            if (name != NULL && salary_str != NULL && priority_str != NULL) {
-                cmd.type = CMD_INSERT;
-                strncpy(cmd.name, name, sizeof(cmd.name) - 1);
-                cmd.name[sizeof(cmd.name) - 1] = '\0';
-                cmd.salary = (uint32_t)atoi(salary_str);
-                cmd.priority = atoi(priority_str);
-            }
-        } else if (strcmp(token, "delete") == 0) {
-            char* name = strtok(NULL, ",");
-            char* priority_str = strtok(NULL, ",");
-
-            if (name != NULL && priority_str != NULL) {
-                cmd.type = CMD_DELETE;
-                strncpy(cmd.name, name, sizeof(cmd.name) - 1);
-                cmd.name[sizeof(cmd.name) - 1] = '\0';
-                cmd.priority = atoi(priority_str);
-            }
-        } else if (strcmp(token, "update") == 0) {
-            char* name = strtok(NULL, ",");
-            char* salary_str = strtok(NULL, ",");
-
-            if (name != NULL && salary_str != NULL) {
-                cmd.type = CMD_UPDATE;
-                strncpy(cmd.name, name, sizeof(cmd.name) - 1);
-                cmd.name[sizeof(cmd.name) - 1] = '\0';
-                cmd.salary = (uint32_t)atoi(salary_str);
-                cmd.priority = 0;
-            }
-        } else if (strcmp(token, "search") == 0) {
-            char* name = strtok(NULL, ",");
-            char* priority_str = strtok(NULL, ",");
-
-            if (name != NULL && priority_str != NULL) {
-                cmd.type = CMD_SEARCH;
-                strncpy(cmd.name, name, sizeof(cmd.name) - 1);
-                cmd.name[sizeof(cmd.name) - 1] = '\0';
-                cmd.priority = atoi(priority_str);
-            }
-        } else if (strcmp(token, "print") == 0) {
-            char* priority_str = strtok(NULL, ",");
-
-            if (priority_str != NULL) {
-                cmd.type = CMD_PRINT;
-                cmd.priority = atoi(priority_str);
-            }
-        }
-
-        if (cmd.type != CMD_INVALID && command_count < 100) {
+        if (parse_command_line(line, &cmd, command_count)) {
             commands[command_count++] = cmd;
         }
     }
 
     qsort(commands, command_count, sizeof(Command),
           compare_commands_by_priority);
+
+    for (int i = 0; i < command_count; i++) {
+        commands[i].order = i;
+    }
 
     pthread_t threads[100];
     ThreadData threadData[100];
@@ -330,8 +247,7 @@ int main(void) {
         pthread_join(threads[i], NULL);
     }
 
-    pthread_mutex_destroy(&scheduler.mutex);
-    pthread_cond_destroy(&scheduler.cond);
+    scheduler_destroy(&scheduler);
 
     rwlock_destroy(&dbLock);
 
