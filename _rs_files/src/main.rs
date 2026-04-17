@@ -2,7 +2,6 @@ mod command;
 mod db;
 mod hash;
 mod logger;
-mod rwlock;
 mod scheduler;
 
 use command::{CommandType, parse_command_line};
