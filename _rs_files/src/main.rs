@@ -4,7 +4,7 @@ mod hash;
 mod logger;
 mod scheduler;
 
-use command::{CommandType, parse_command_line};
+use command::{parse_command_line, CommandType};
 use db::Database;
 use logger::{
     create_logger, log_command, log_read_lock_acquired, log_read_lock_released,
